@@ -40,7 +40,29 @@ logger = logging.getLogger(__name__)
 # FIRESTORE CLIENT
 # ============================================================================
 
-db = firestore.Client(database=settings.FIRESTORE_DATABASE)
+IN_MEMORY_PATIENT_STORE = {}
+
+
+def model_dump_compat(model):
+    """Support pydantic v1/v2 serialization."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def get_firestore_client():
+    """Initialise Firestore uniquement si les credentials sont disponibles."""
+    try:
+        return firestore.Client(database=settings.FIRESTORE_DATABASE)
+    except Exception as exc:  # pragma: no cover - depends on local env
+        logger.warning(
+            "Firestore indisponible (%s). Utilisation du stockage mémoire local.",
+            exc,
+        )
+        return None
+
+
+db = get_firestore_client()
 
 # ============================================================================
 # SCHEMAS PYDANTIC
@@ -132,29 +154,55 @@ def update_patient_state(state: PatientState) -> PatientState:
 
 def get_patient_state(patient_id: str) -> PatientState:
     """Récupère l'état du patient depuis Firestore ou retourne un état initial."""
+    if db is None:
+        state = IN_MEMORY_PATIENT_STORE.get(patient_id)
+        if state is not None:
+            return state
+        logger.info("Nouveau patient %s, état initial créé", patient_id)
+        initial_state = PatientState(
+            glucose_level=settings.INITIAL_GLUCOSE_LEVEL_MG_DL,
+            insulin_active=0.0,
+            carbs_active=0.0,
+            last_update=datetime.now(timezone.utc),
+        )
+        IN_MEMORY_PATIENT_STORE[patient_id] = initial_state
+        return initial_state
+
     doc_ref = db.collection("patients").document(patient_id)
     doc = doc_ref.get()
 
     if doc.exists:
         data = doc.to_dict()
+        if "last_update" in data and hasattr(data["last_update"], "to_pydatetime"):
+            data["last_update"] = data["last_update"].to_pydatetime()
         if "last_update" not in data or not isinstance(data["last_update"], datetime):
             data["last_update"] = datetime.now(timezone.utc)
         return PatientState(**data)
 
     # Aucun état existant - retourner un état initial sain
     logger.info("Nouveau patient %s, état initial créé", patient_id)
-    return PatientState(
+    state = PatientState(
         glucose_level=settings.INITIAL_GLUCOSE_LEVEL_MG_DL,
         insulin_active=0.0,
         carbs_active=0.0,
         last_update=datetime.now(timezone.utc),
     )
+    return state
 
 
 def save_patient_state(patient_id: str, state: PatientState) -> None:
-    """Sauvegarde l'etat du patient dans Firestore."""
+    """Sauvegarde l'etat du patient dans Firestore ou la mémoire locale."""
+    if db is None:
+        IN_MEMORY_PATIENT_STORE[patient_id] = state
+        logger.info(
+            "Etat du patient %s sauvegarde (mémoire locale): glucose=%.1f mg/dL",
+            patient_id,
+            state.glucose_level,
+        )
+        return
+
     doc_ref = db.collection("patients").document(patient_id)
-    doc_ref.set(state.model_dump())
+    doc_ref.set(model_dump_compat(state))
     logger.info(
         "Etat du patient %s sauvegarde : glucose=%.1f mg/dL",
         patient_id,
@@ -164,6 +212,16 @@ def save_patient_state(patient_id: str, state: PatientState) -> None:
 
 def reset_patient_state(patient_id: str) -> PatientState:
     """Réinitialise l'état du patient à l'état initial."""
+    if db is None:
+        IN_MEMORY_PATIENT_STORE.pop(patient_id, None)
+        logger.info("Etat du patient %s réinitialisé", patient_id)
+        return PatientState(
+            glucose_level=settings.INITIAL_GLUCOSE_LEVEL_MG_DL,
+            insulin_active=0.0,
+            carbs_active=0.0,
+            last_update=datetime.now(timezone.utc),
+        )
+
     doc_ref = db.collection("patients").document(patient_id)
     doc_ref.delete()
     logger.info("Etat du patient %s réinitialisé", patient_id)
